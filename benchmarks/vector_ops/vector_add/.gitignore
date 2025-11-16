@@ -1,0 +1,22 @@
+# Compiled binaries
+v0_naive
+v1_coalesced
+v2_vectorized
+v3_shared_tiling
+v4_optimized
+
+# NCU reports
+*.ncu-rep
+*.nsys-rep
+
+# Benchmark results
+benchmark_results.txt
+*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Triton cache
+~/.triton/
