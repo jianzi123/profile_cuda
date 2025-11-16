@@ -1,1002 +1,1177 @@
-# 全局视角的算子性能分析与优化
+# 全局性能优化：专家级方法论
+
+> **核心思想**：单个 kernel 优化是战术，全局优化是战略。90% 的工程师只做战术优化，但真正的 10x 性能提升来自战略层面。
+
+---
 
 ## 目录
-1. [全局优化概述](#全局优化概述)
-2. [端到端性能分析](#端到端性能分析)
-3. [算子融合策略](#算子融合策略)
-4. [内存复用与优化](#内存复用与优化)
-5. [系统级性能分析](#系统级性能分析)
-6. [完整优化工作流](#完整优化工作流)
+
+1. [性能分析的三个层次](#性能分析的三个层次)
+2. [Roofline 模型：性能的物理极限](#roofline-模型性能的物理极限)
+3. [Amdahl's Law：优化的投资回报率](#amdahls-law优化的投资回报率)
+4. [系统级瓶颈分析框架](#系统级瓶颈分析框架)
+5. [实战案例：Transformer 训练优化](#实战案例transformer-训练优化)
+6. [反直觉的优化策略](#反直觉的优化策略)
+7. [Production 环境的隐藏陷阱](#production-环境的隐藏陷阱)
 
 ---
 
-## 全局优化概述
+## 性能分析的三个层次
 
-### 为什么需要全局视角？
-
-单个 kernel 的优化是微观层面，但在实际应用中：
+### Level 1: Kernel 层（90% 工程师停留在这里）
 
 ```
-End-to-End Performance ≠ Sum(Individual Kernel Performance)
+问题：这个 kernel 为什么慢？
+工具：NCU
+优化：内存访问、occupancy、ILP
+提升：1.2x - 3x
 ```
 
-**系统级开销：**
-- Kernel 启动延迟（~5-10 μs）
-- 内存传输时间
-- CPU-GPU 同步
-- 算子间数据依赖
-- 内存分配/释放
+**陷阱**：优化了一个占总时间 5% 的 kernel，提升 2x，总体只快了 2.5%
 
-**全局优化关注：**
-1. 算子间的数据流
-2. 内存使用模式
-3. 并行执行机会
-4. 算子融合可能性
-5. 端到端吞吐量
-
-### 优化层次
+### Level 2: Pipeline 层（优秀工程师的领域）
 
 ```
-┌─────────────────────────────────────┐
-│ 1. Application Level (应用层)       │  ← 算法选择、数据结构
-├─────────────────────────────────────┤
-│ 2. Framework Level (框架层)         │  ← 图优化、算子融合
-├─────────────────────────────────────┤
-│ 3. Kernel Level (算子层)            │  ← 单个 kernel 优化
-├─────────────────────────────────────┤
-│ 4. Instruction Level (指令层)       │  ← SASS 优化、寄存器分配
-└─────────────────────────────────────┘
+问题：kernels 之间的交互有什么问题？
+工具：Nsight Systems
+优化：算子融合、并行、重叠
+提升：2x - 10x
 ```
 
-我们需要在**所有层次**进行优化！
+**关键洞察**：
+```
+总时间 = Σ(kernel_time) + Σ(launch_overhead) + Σ(memory_transfer) + idle_time
+
+很多时候：
+- launch_overhead > kernel_time（小 kernel 问题）
+- idle_time > compute_time（流水线断裂）
+- memory_transfer 可以与 compute 重叠（但没做）
+```
+
+### Level 3: 系统层（顶尖工程师的思维）
+
+```
+问题：这个算法/架构在这个硬件上的理论极限是什么？我们距离极限还有多远？
+工具：Roofline 模型、数学分析、硬件手册
+优化：算法选择、数据流重组、架构调整
+提升：10x - 100x
+```
+
+**核心问题**：
+```python
+# 错误的问题
+"如何让这个 GEMM kernel 更快？"
+
+# 正确的问题
+"在 A100 上，FP16 GEMM 的理论峰值是 312 TFLOPS
+ 我们的实现达到了 180 TFLOPS (58%)
+ 剩余的 42% 在哪里？能否突破 90%？"
+```
 
 ---
 
-## 端到端性能分析
+## Roofline 模型：性能的物理极限
 
-### 1. 使用 Nsight Systems 全局分析
+### 什么是 Roofline？
 
-**与 NCU 的区别：**
-- **Nsight Systems**：宏观，看时间线，找全局瓶颈
-- **Nsight Compute**：微观，看单个 kernel，找细节问题
+Roofline 模型告诉你：**在特定硬件上，给定 Arithmetic Intensity，性能的物理上限是多少**
+
+```
+              Performance (TFLOPS)
+                    │
+Peak Compute (312)  │         ┌─────────────── Compute Roof
+                    │        ╱
+                    │       ╱
+                    │      ╱
+                    │     ╱  Diagonal = Memory Roof
+                    │    ╱   slope = Bandwidth
+                    │   ╱
+                    │  ╱
+                    │ ╱
+                    │╱
+────────────────────┼──────────────────────────► AI (FLOPS/Byte)
+                    0    1    10   100  1000
+                         │
+                    Ridge Point = Peak Compute / Peak Bandwidth
+```
+
+### A100 的 Roofline 参数
+
+| 硬件参数 | FP32 | FP16 (Tensor Core) |
+|---------|------|-------------------|
+| Peak Compute | 19.5 TFLOPS | 312 TFLOPS |
+| Peak Bandwidth | 1.5 TB/s | 1.5 TB/s |
+| Ridge Point | 13 FLOPS/Byte | 208 FLOPS/Byte |
+
+**关键洞察**：
+
+```python
+AI = FLOPS / Bytes_Accessed
+
+# Matrix Multiplication (M=N=K=4096, FP16)
+FLOPS = 2 * M * N * K = 137 GFLOPS
+Bytes = 2 * (M*K + K*N + M*N) * 2 bytes = 201 MB
+AI = 137 / 0.2 = 685 FLOPS/Byte
+
+685 > 208 → Compute-bound → 理论峰值 = 312 TFLOPS ✓
+
+# Element-wise Add (N=1M, FP32)
+FLOPS = N = 1M
+Bytes = 3 * N * 4 bytes = 12 MB
+AI = 1 / 12 = 0.083 FLOPS/Byte
+
+0.083 << 13 → Memory-bound → 理论峰值 = 0.083 * 1.5TB/s = 125 GFLOPS
+```
+
+### 使用 Roofline 指导优化
+
+#### 案例 1：LayerNorm (典型的 Memory-bound)
+
+```python
+# LayerNorm: mean, var, normalize
+# Input: [B, N] = [128, 4096]
+# FLOPS: ~4 * B * N = 2M FLOPS
+# Bytes: ~4 * B * N * 4 bytes = 8 MB (read) + 8 MB (write) = 16 MB
+# AI = 2M / 16M = 0.125 FLOPS/Byte
+
+理论峰值 = 0.125 * 1.5 TB/s = 187.5 GFLOPS
+实际测量 = 145 GFLOPS
+效率 = 145 / 187.5 = 77% ← 已经很好了！
+
+结论：不要在这里浪费时间优化 kernel 细节，77% 已经接近极限
+```
+
+**关键决策**：如果一个 Memory-bound kernel 已经达到带宽的 75%+，继续优化 kernel 内部是浪费时间，应该：
+1. 融合相邻 kernel 减少内存访问
+2. 或者接受这个性能，优化其他地方
+
+#### 案例 2：GEMM (Compute-bound)
+
+```python
+# GEMM: C = A @ B
+# A: [4096, 4096], B: [4096, 4096], FP16
+# FLOPS: 2 * 4096^3 = 137 GFLOPS
+# Bytes (no reuse): (4096^2 + 4096^2 + 4096^2) * 2 = 100 MB
+# Bytes (optimal with blocking): 理论最小 ~ 3 * 4096 * sqrt(cache_size)
+
+AI > 208 → Compute-bound
+
+理论峰值 (Tensor Core) = 312 TFLOPS
+cuBLAS 实际 = 280 TFLOPS (90% 效率) ← 已经极致优化
+朴素实现 = 15 TFLOPS (5% 效率) ← 别自己写 GEMM！
+
+结论：使用 cuBLAS / cuDNN，不要自己写
+```
+
+### Roofline 分析工具
 
 ```bash
-# 使用 Nsight Systems 收集整体 trace
-nsys profile -o timeline \
-    --trace=cuda,nvtx,osrt \
-    --cuda-memory-usage=true \
-    python train.py
+# NCU 自动生成 Roofline 分析
+ncu --set roofline -o profile ./program
 
-# 查看结果
-nsys-ui timeline.qdrep
-```
-
-**在时间线中查看：**
-
-```
-CPU Timeline:
-  ████ Python ████ CUDA API ████ Python ████
-
-GPU Timeline:
-  Kernel1 ─┐
-           │ Gap! (浪费)
-           └─ Kernel2 ──┐
-                        │ Memory Copy (可以重叠？)
-                        └─ Kernel3
-
-Memory Timeline:
-  H→D Copy ──── D→H Copy ────
-```
-
-**寻找的问题：**
-1. **GPU Idle Time**：GPU 空闲，CPU 在干什么？
-2. **Kernel Launch Overhead**：太多小 kernel
-3. **Memory Transfer Bottleneck**：CPU-GPU 传输过多
-4. **Synchronization Points**：不必要的同步
-5. **CPU Bottleneck**：CPU 跟不上 GPU
-
-### 2. NVTX 标记关键区域
-
-```cpp
-#include <nvtx3/nvToolsExt.h>
-
-void forward_pass() {
-    nvtxRangePushA("Forward Pass");
-
-    nvtxRangePushA("Conv1");
-    conv1_kernel<<<grid, block>>>(data);
-    nvtxRangePop();
-
-    nvtxRangePushA("ReLU");
-    relu_kernel<<<grid, block>>>(data);
-    nvtxRangePop();
-
-    nvtxRangePushA("Pool");
-    pool_kernel<<<grid, block>>>(data);
-    nvtxRangePop();
-
-    nvtxRangePop();
-}
-```
-
-**Python 版本：**
-```python
-import torch
-from torch.cuda import nvtx
-
-def forward(x):
-    with nvtx.range("Forward Pass"):
-        with nvtx.range("Conv1"):
-            x = conv1(x)
-        with nvtx.range("ReLU"):
-            x = relu(x)
-        with nvtx.range("Pool"):
-            x = pool(x)
-    return x
-```
-
-在 Nsight Systems 中可以看到这些标记，快速定位问题区域。
-
-### 3. 端到端性能指标
-
-```python
-import torch
-import time
-
-def benchmark_e2e(model, input_data, num_iterations=100):
-    """端到端性能测试"""
-
-    # Warmup
-    for _ in range(10):
-        _ = model(input_data)
-    torch.cuda.synchronize()
-
-    # Benchmark
-    start = time.time()
-    for _ in range(num_iterations):
-        output = model(input_data)
-    torch.cuda.synchronize()
-    end = time.time()
-
-    avg_time = (end - start) / num_iterations * 1000  # ms
-    throughput = num_iterations / (end - start)  # samples/s
-
-    print(f"Avg Latency: {avg_time:.2f} ms")
-    print(f"Throughput: {throughput:.2f} samples/s")
-
-    return avg_time, throughput
-```
-
-### 4. 分析 CPU-GPU 交互
-
-```python
-import torch.profiler as profiler
-
-with profiler.profile(
-    activities=[
-        profiler.ProfilerActivity.CPU,
-        profiler.ProfilerActivity.CUDA,
-    ],
-    with_stack=True,
-    with_flops=True,
-) as prof:
-    model(input_data)
-
-# 打印报告
-print(prof.key_averages().table(
-    sort_by="cuda_time_total", row_limit=10
-))
-
-# 导出 Chrome trace
-prof.export_chrome_trace("trace.json")
-# 在 chrome://tracing 中查看
+# 在 NCU GUI 中查看：
+# Details -> Roofline Analysis
+# 会显示你的 kernel 在 Roofline 图上的位置
 ```
 
 ---
 
-## 算子融合策略
+## Amdahl's Law：优化的投资回报率
 
-### 1. 为什么需要算子融合？
+### Amdahl's Law 基础
 
-**问题：多个小 kernel**
-```python
-# 三个独立的 kernel
-x = relu(x)            # Kernel 1: 读 x, 写 x
-x = x + bias          # Kernel 2: 读 x, 写 x
-x = dropout(x)        # Kernel 3: 读 x, 写 x
+```
+整体加速比 = 1 / ((1 - P) + P / S)
+
+P = 被优化部分占总时间的比例
+S = 该部分的加速比
 ```
 
-**开销：**
-- 3 次 kernel 启动（~15-30 μs）
-- 3 次全局内存读写
-- 中间结果存储
+### 实战应用：优化决策树
 
-**融合后：**
-```python
-# 单个融合 kernel
-x = fused_relu_bias_dropout(x, bias)  # 只读写一次！
+假设你有一个端到端时间为 100ms 的程序：
+
+```
+Profile 结果：
+- Kernel A: 50ms (50%)
+- Kernel B: 30ms (30%)
+- Kernel C: 10ms (10%)
+- Memory Copy: 5ms (5%)
+- Others: 5ms (5%)
 ```
 
-**收益：**
-- 1 次 kernel 启动
-- 1 次全局内存读写
-- 减少中间存储
+**决策矩阵**：
 
-### 2. Element-wise 算子融合
+| 优化目标 | 预期加速 | 优化时间 | 整体提升 | ROI |
+|---------|---------|---------|---------|-----|
+| Kernel A (2x) | 50ms → 25ms | 2 天 | 100ms → 75ms (1.33x) | ⭐⭐⭐⭐⭐ |
+| Kernel B (3x) | 30ms → 10ms | 3 天 | 100ms → 80ms (1.25x) | ⭐⭐⭐ |
+| Kernel C (10x) | 10ms → 1ms | 5 天 | 100ms → 91ms (1.1x) | ⭐ |
+| A+B 融合 (1.5x) | 80ms → 53ms | 1 天 | 100ms → 73ms (1.37x) | ⭐⭐⭐⭐⭐ |
 
-```cpp
-// 融合前：3 个 kernel
-__global__ void relu_kernel(float* data, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        data[idx] = fmaxf(0.0f, data[idx]);
-    }
-}
-
-__global__ void add_bias_kernel(float* data, float bias, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        data[idx] += bias;
-    }
-}
-
-__global__ void scale_kernel(float* data, float scale, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        data[idx] *= scale;
-    }
-}
-
-// 融合后：1 个 kernel
-__global__ void fused_relu_bias_scale(float* data, float bias, float scale, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        float val = data[idx];
-        val = fmaxf(0.0f, val);  // ReLU
-        val += bias;              // Add bias
-        val *= scale;             // Scale
-        data[idx] = val;
-    }
-}
-```
-
-**性能提升：** 通常 2-5 倍
-
-### 3. Triton 自动融合
-
-Triton 的 JIT 编译器可以自动融合某些操作：
+**量化公式**：
 
 ```python
-import triton
-import triton.language as tl
+def calculate_roi(original_time, part_ratio, speedup, dev_days):
+    """计算优化的 ROI"""
+    new_time = original_time * (1 - part_ratio + part_ratio / speedup)
+    overall_speedup = original_time / new_time
 
-@triton.jit
-def fused_kernel(
-    x_ptr, bias_ptr, out_ptr,
-    N,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < N
+    # 假设每天开发成本 = 1
+    roi = (overall_speedup - 1) / dev_days
 
-    # 一次性完成多个操作（Triton 自动优化）
-    x = tl.load(x_ptr + offsets, mask=mask)
-    bias = tl.load(bias_ptr + offsets, mask=mask)
+    return overall_speedup, roi
 
-    # 融合操作
-    out = tl.where(x > 0, x, 0.0)  # ReLU
-    out = out + bias                # Add
-    out = out * 2.0                 # Scale
-
-    tl.store(out_ptr + offsets, out, mask=mask)
+# 例子
+print(calculate_roi(100, 0.5, 2, 2))  # (1.33x, 0.165)
+print(calculate_roi(100, 0.1, 10, 5)) # (1.1x, 0.02)
 ```
 
-### 4. 更复杂的融合：LayerNorm + Linear
+**结论**：优先优化占时间最多的部分，即使加速比不是最高
 
-```cpp
-// 融合 LayerNorm 和 Linear
-__global__ void fused_layernorm_linear(
-    const float* input,      // [B, N]
-    const float* gamma,      // [N]
-    const float* beta,       // [N]
-    const float* weight,     // [N, M]
-    const float* bias,       // [M]
-    float* output,           // [B, M]
-    int B, int N, int M
-) {
-    int row = blockIdx.x;
-    int col = threadIdx.x;
-
-    // 第一步：LayerNorm
-    __shared__ float s_mean, s_var;
-
-    // 计算均值
-    float sum = 0.0f;
-    for (int i = col; i < N; i += blockDim.x) {
-        sum += input[row * N + i];
-    }
-    sum = warp_reduce_sum(sum);
-    if (col == 0) s_mean = sum / N;
-    __syncthreads();
-
-    // 计算方差
-    float var = 0.0f;
-    for (int i = col; i < N; i += blockDim.x) {
-        float diff = input[row * N + i] - s_mean;
-        var += diff * diff;
-    }
-    var = warp_reduce_sum(var);
-    if (col == 0) s_var = var / N;
-    __syncthreads();
-
-    // 归一化并存储到 shared memory
-    __shared__ float normalized[1024];
-    for (int i = col; i < N; i += blockDim.x) {
-        float val = input[row * N + i];
-        normalized[i] = (val - s_mean) * rsqrtf(s_var + 1e-5) * gamma[i] + beta[i];
-    }
-    __syncthreads();
-
-    // 第二步：Linear（直接使用 shared memory 中的 normalized 数据）
-    for (int j = col; j < M; j += blockDim.x) {
-        float sum = 0.0f;
-        for (int k = 0; k < N; k++) {
-            sum += normalized[k] * weight[k * M + j];
-        }
-        output[row * M + j] = sum + bias[j];
-    }
-}
-```
-
-**融合收益：**
-- 避免 LayerNorm 的中间结果写回全局内存
-- 利用 shared memory 缓存归一化后的数据
-- 减少一次 kernel 启动
-
-### 5. PyTorch JIT Fusion
+### 现实中的 Amdahl's Law
 
 ```python
-import torch
+# 错误思维
+"我把这个 kernel 从 1ms 优化到 0.1ms，加速 10x！"
+→ 但这个 kernel 只占总时间的 2%
+→ 总体只快了 1.8%
+→ 浪费了 3 天
 
-# 方法 1: TorchScript
-@torch.jit.script
-def fused_ops(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    x = torch.relu(x)
-    x = x + bias
-    x = x * 2.0
-    return x
-
-# PyTorch 会自动融合这些操作
-
-# 方法 2: torch.compile (PyTorch 2.0+)
-@torch.compile
-def fused_ops_v2(x, bias):
-    x = torch.relu(x)
-    x = x + bias
-    x = x * 2.0
-    return x
+# 正确思维
+"这个 kernel 占总时间 40%，即使只优化 50%，总体也能快 20%"
+→ 优先优化这个
+→ ROI 高 10 倍
 ```
 
 ---
 
-## 内存复用与优化
+## 系统级瓶颈分析框架
 
-### 1. 内存池（Memory Pool）
+### 五维分析模型
 
-```cpp
-#include <cuda_runtime.h>
-
-class MemoryPool {
-private:
-    std::vector<void*> pool;
-    std::vector<size_t> sizes;
-
-public:
-    void* allocate(size_t bytes) {
-        // 查找可复用的内存块
-        for (size_t i = 0; i < pool.size(); i++) {
-            if (sizes[i] >= bytes && !in_use[i]) {
-                in_use[i] = true;
-                return pool[i];
-            }
-        }
-
-        // 如果没有，分配新的
-        void* ptr;
-        cudaMalloc(&ptr, bytes);
-        pool.push_back(ptr);
-        sizes.push_back(bytes);
-        in_use.push_back(true);
-        return ptr;
-    }
-
-    void release(void* ptr) {
-        for (size_t i = 0; i < pool.size(); i++) {
-            if (pool[i] == ptr) {
-                in_use[i] = false;
-                return;
-            }
-        }
-    }
-
-    ~MemoryPool() {
-        for (auto ptr : pool) {
-            cudaFree(ptr);
-        }
-    }
-};
+```
+端到端性能 = f(Compute, Memory, Launch, Transfer, Sync)
 ```
 
-**PyTorch 内置：**
+#### 1. Compute（计算瓶颈）
+
+**识别**：
+```bash
+nsys profile ./program
+# 查看 GPU Utilization
+# 如果 SM Active > 80%，大部分时间都在计算 → Compute-bound
+```
+
+**量化**：
 ```python
+实际 FLOPS / 理论峰值 FLOPS = 计算效率
+
+# A100 FP16 Tensor Core
+理论峰值 = 312 TFLOPS
+
+# 如果测到 280 TFLOPS → 90% 效率 → 已接近极限
+# 如果测到 150 TFLOPS → 48% 效率 → 还有优化空间
+```
+
+**优化方向**：
+- Kernel 层：提高 occupancy、减少 divergence、使用 Tensor Cores
+- 算法层：选择计算复杂度更低的算法（如 Flash Attention）
+
+#### 2. Memory（内存瓶颈）
+
+**识别**：
+```bash
+ncu --section SpeedOfLight ./program
+# Memory Throughput > 80% → Memory-bound
+```
+
+**量化**：
+```python
+实际带宽 / 理论峰值带宽 = 带宽效率
+
+# A100
+理论峰值 HBM 带宽 = 1.5 TB/s
+
+# 如果测到 1.2 TB/s → 80% 效率 → 接近极限
+# 如果测到 600 GB/s → 40% 效率 → 大量优化空间
+```
+
+**深入分析**：Memory 瓶颈有多种类型：
+
+```
+Memory 层次结构：
+HBM (1.5 TB/s, 40GB)
+  ↕ ~200 cycles
+L2 Cache (6 MB, ~5 TB/s)
+  ↕ ~50 cycles
+L1/Shared (192 KB/SM, ~20 TB/s)
+  ↕ ~5 cycles
+Registers (64K regs/SM, ~100 TB/s)
+  ↕ ~1 cycle
+```
+
+**案例分析**：
+
+```python
+# 案例：Element-wise 操作慢
+
+# 第一步：检查是哪一层的内存瓶颈
+ncu --metrics \
+    dram__throughput.avg.pct_of_peak_sustained_elapsed,\
+    lts__t_sectors_srcunit_tex_op_read.sum,\
+    l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum \
+    ./program
+
+输出：
+dram__throughput = 85% ← HBM 接近饱和
+lts (L2) hit rate = 20% ← L2 几乎没缓存
+l1tex hit rate = 95% ← L1 缓存很好
+
+诊断：数据没有跨 kernel 复用，每次都从 HBM 读取
+优化：算子融合，让数据留在 L1/L2
+
+# 第二步：检查访问模式
+ncu --metrics l1tex__average_t_sectors_per_request ./program
+
+输出：
+l1tex__average_t_sectors_per_request = 3.2
+
+理想值 = 1.0 (完美 coalesced)
+实际值 = 3.2 → 每次请求浪费了 3.2 - 1 = 2.2 个 sector
+浪费带宽 = 68%
+
+优化：修复访问模式（见 03_performance_optimization）
+```
+
+#### 3. Launch Overhead（启动开销）
+
+**识别**：
+```bash
+nsys profile ./program
+# 查看 Timeline
+# 如果看到大量 gaps between kernels → Launch overhead 问题
+```
+
+**量化**：
+```python
+# Kernel launch overhead ≈ 5-10 μs per kernel
+
+# 案例：100 个小 kernel，每个 50 μs
+kernel_time = 100 * 50 = 5000 μs = 5 ms
+launch_overhead = 100 * 7 = 700 μs = 0.7 ms
+overhead_ratio = 0.7 / 5 = 14%
+
+# 融合后：1 个大 kernel，100 * 50 = 5000 μs
+kernel_time = 5 ms
+launch_overhead = 7 μs
+overhead_ratio = 0.14%
+
+加速比 = 5.7 / 5.007 = 1.14x
+```
+
+**优化策略**：
+```python
+# 1. 算子融合（最有效）
+加速比：1.1x - 10x (取决于 kernel 数量和大小)
+
+# 2. CUDA Graphs（减少 CPU overhead）
+加速比：1.05x - 1.3x (对小 kernel 密集的 workload)
+
+# 3. Persistent Kernels（高级）
+概念：让 kernel 一直运行，通过 shared memory 或 global memory 通信
+加速比：1.2x - 2x
+适用：高频调用的小 kernel
+```
+
+#### 4. Transfer（数据传输）
+
+**识别**：
+```bash
+nsys profile --trace=cuda,nvtx ./program
+# 查看 Memory Operations
+# 如果 H2D/D2H copy 时间 > 10% → Transfer 瓶颈
+```
+
+**量化**：
+```python
+# PCIe 3.0 x16: ~12 GB/s (双向各 12 GB/s)
+# PCIe 4.0 x16: ~24 GB/s
+
+# 案例：传输 1GB 数据
+理论时间 (PCIe 3.0) = 1GB / 12GB/s = 83 ms
+如果测量到 90 ms → 效率 = 92% → 正常
+如果测量到 200 ms → 效率 = 41% → 有问题
+
+可能原因：
+- 使用了 pageable memory（不是 pinned）
+- 小数据多次传输（overhead 大）
+- 没有使用异步传输
+```
+
+**优化策略**：
+
+```python
+# 1. 减少传输（最优先！）
+# 尽量在 GPU 上完成所有操作
+加速比：无限大 (0ms vs 100ms)
+
+# 2. Pinned Memory
 import torch
 
-# PyTorch 自动使用内存池
-# 查看内存使用
-print(torch.cuda.memory_allocated())
-print(torch.cuda.memory_reserved())
+# ❌ Pageable memory
+data = torch.randn(1000000)
+data_gpu = data.cuda()  # 慢！~200 MB/s
 
-# 清空缓存（如果需要）
-torch.cuda.empty_cache()
-```
+# ✅ Pinned memory
+data = torch.randn(1000000).pin_memory()
+data_gpu = data.cuda()  # 快！~12 GB/s
 
-### 2. In-place 操作
+加速比：10x - 100x
 
-```python
-# ❌ 非 in-place：创建新的 tensor
-x = x + 1
-
-# ✅ In-place：复用内存
-x.add_(1)
-
-# 常见 in-place 操作
-x.relu_()
-x.mul_(2.0)
-x.add_(bias)
-```
-
-**CUDA 版本：**
-```cpp
-// In-place ReLU
-__global__ void relu_inplace(float* data, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        data[idx] = fmaxf(0.0f, data[idx]);  // 直接修改
-    }
-}
-```
-
-### 3. 内存重用分析
-
-```python
-# 使用 Nsight Systems 查看内存使用模式
-# nsys profile --trace=cuda --cuda-memory-usage=true python script.py
-
-# 或使用 PyTorch Profiler
-with torch.profiler.profile(
-    profile_memory=True,
-    record_shapes=True,
-) as prof:
-    model(input_data)
-
-print(prof.key_averages().table(sort_by="self_cuda_memory_usage"))
-```
-
-### 4. Workspace 复用
-
-```cpp
-// 多个算子共享临时工作空间
-void* workspace = nullptr;
-size_t workspace_size = 0;
-
-// 计算所需的最大 workspace
-size_t conv1_ws = get_conv_workspace_size(conv1);
-size_t conv2_ws = get_conv_workspace_size(conv2);
-workspace_size = max(conv1_ws, conv2_ws);
-
-cudaMalloc(&workspace, workspace_size);
-
-// 复用 workspace
-conv1_kernel<<<...>>>(data1, workspace);
-conv2_kernel<<<...>>>(data2, workspace);  // 复用同一块内存
-
-cudaFree(workspace);
-```
-
----
-
-## 系统级性能分析
-
-### 1. 分析整个训练/推理流程
-
-```python
-import torch
-from torch.profiler import profile, ProfilerActivity
-
-class Model:
-    def forward(self, x):
-        # Model implementation
-        pass
-
-def analyze_pipeline():
-    model = Model()
-    input_data = torch.randn(32, 3, 224, 224, device='cuda')
-
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        profile_memory=True,
-        with_stack=True,
-    ) as prof:
-        for _ in range(10):
-            output = model.forward(input_data)
-            loss = output.sum()
-            loss.backward()
-
-    # 分析结果
-    print("=== Top CUDA Kernels ===")
-    print(prof.key_averages().table(
-        sort_by="cuda_time_total",
-        row_limit=10
-    ))
-
-    print("\n=== Memory Usage ===")
-    print(prof.key_averages().table(
-        sort_by="self_cuda_memory_usage",
-        row_limit=10
-    ))
-
-    # 查看 CPU 时间
-    print("\n=== CPU Time ===")
-    print(prof.key_averages().table(
-        sort_by="cpu_time_total",
-        row_limit=10
-    ))
-```
-
-### 2. 多流并行
-
-```python
-import torch
-
-# 创建多个 CUDA streams
+# 3. 异步传输 + 重叠
 stream1 = torch.cuda.Stream()
 stream2 = torch.cuda.Stream()
 
-# 并行执行
 with torch.cuda.stream(stream1):
-    output1 = model1(input1)
+    data1_gpu = data1.cuda(non_blocking=True)
+    kernel1(data1_gpu)
 
 with torch.cuda.stream(stream2):
-    output2 = model2(input2)
+    data2_gpu = data2.cuda(non_blocking=True)  # 与 kernel1 重叠
+    kernel2(data2_gpu)
 
-# 等待所有 stream 完成
+加速比：1.5x - 2x
+```
+
+#### 5. Sync（同步开销）
+
+**识别**：
+```python
+# 代码中每次调用这些都会同步：
 torch.cuda.synchronize()
+tensor.cpu()  # 隐式同步
+tensor.item()  # 隐式同步
+print(tensor)  # 隐式同步（如果是 GPU tensor）
+
+# 在 nsys 中看到大量 cudaDeviceSynchronize → Sync 问题
 ```
 
-**CUDA 版本：**
-```cpp
-cudaStream_t stream1, stream2;
-cudaStreamCreate(&stream1);
-cudaStreamCreate(&stream2);
+**案例**：
 
-// 在不同 stream 中并行执行
-kernel1<<<grid, block, 0, stream1>>>(data1);
-kernel2<<<grid, block, 0, stream2>>>(data2);
-
-// 异步拷贝也可以并行
-cudaMemcpyAsync(d_data1, h_data1, size, cudaMemcpyHostToDevice, stream1);
-kernel1<<<grid, block, 0, stream1>>>(d_data1);
-cudaMemcpyAsync(h_result1, d_result1, size, cudaMemcpyDeviceToHost, stream1);
-
-cudaStreamSynchronize(stream1);
-cudaStreamSynchronize(stream2);
-```
-
-### 3. 重叠计算与通信
-
-```cpp
-// 将数据分块，重叠拷贝和计算
-const int num_chunks = 4;
-const int chunk_size = N / num_chunks;
-
-cudaStream_t streams[num_chunks];
-for (int i = 0; i < num_chunks; i++) {
-    cudaStreamCreate(&streams[i]);
-}
-
-for (int i = 0; i < num_chunks; i++) {
-    int offset = i * chunk_size;
-
-    // 异步拷贝
-    cudaMemcpyAsync(
-        d_data + offset,
-        h_data + offset,
-        chunk_size * sizeof(float),
-        cudaMemcpyHostToDevice,
-        streams[i]
-    );
-
-    // 计算（与下一个 chunk 的拷贝重叠）
-    kernel<<<grid, block, 0, streams[i]>>>(d_data + offset, chunk_size);
-
-    // 拷贝回主机
-    cudaMemcpyAsync(
-        h_result + offset,
-        d_result + offset,
-        chunk_size * sizeof(float),
-        cudaMemcpyDeviceToHost,
-        streams[i]
-    );
-}
-
-// 等待所有完成
-for (int i = 0; i < num_chunks; i++) {
-    cudaStreamSynchronize(streams[i]);
-    cudaStreamDestroy(streams[i]);
-}
-```
-
-### 4. 图优化（CUDA Graphs）
-
-```cpp
-#include <cuda_runtime.h>
-
-cudaGraph_t graph;
-cudaGraphExec_t instance;
-
-// 开始捕获
-cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-
-// 执行一系列操作（这些会被记录到 graph 中）
-kernel1<<<grid, block, 0, stream>>>(data);
-kernel2<<<grid, block, 0, stream>>>(data);
-kernel3<<<grid, block, 0, stream>>>(data);
-
-// 结束捕获
-cudaStreamEndCapture(stream, &graph);
-
-// 实例化 graph
-cudaGraphInstantiate(&instance, graph, NULL, NULL, 0);
-
-// 重复执行（开销极低！）
-for (int i = 0; i < 1000; i++) {
-    cudaGraphLaunch(instance, stream);
-}
-
-cudaStreamSynchronize(stream);
-```
-
-**PyTorch 版本：**
 ```python
-import torch
+# ❌ 错误：频繁同步
+for i in range(1000):
+    loss = model(data)
+    print(f"Loss: {loss.item()}")  # 每次都同步！← 极慢
 
-# 创建 CUDA graph
-g = torch.cuda.CUDAGraph()
+# 测量：1000 次迭代用了 50 秒
+# 其中 sync overhead = 1000 * 10μs = 10ms... 不对，为什么这么慢？
 
-# Static input
-static_input = torch.randn(32, 3, 224, 224, device='cuda')
-static_output = torch.empty(32, 1000, device='cuda')
+# 真相：每次 .item() 都会：
+# 1. GPU kernel 执行（异步）
+# 2. .item() 触发同步，等待 GPU 完成
+# 3. D2H 传输
+# 4. CPU 处理
+# → 完全破坏了 GPU 的并行流水线！
 
-# Warmup
-for _ in range(3):
-    static_output = model(static_input)
+# ✅ 正确：批量同步
+losses = []
+for i in range(1000):
+    loss = model(data)
+    losses.append(loss)
 
-# 捕获 graph
-with torch.cuda.graph(g):
-    static_output = model(static_input)
+torch.cuda.synchronize()  # 只同步一次
+losses_cpu = [l.item() for l in losses]
 
-# 重复执行（非常快！）
-for _ in range(1000):
-    g.replay()
+# 测量：1000 次迭代用了 5 秒
+加速比：10x
 ```
-
-**性能提升：** 对于小 kernel 密集的工作负载，可以提升 2-3 倍
 
 ---
 
-## 完整优化工作流
+## 实战案例：Transformer 训练优化
 
-### 第一阶段：建立基线
+### 场景
+
+```
+模型：GPT-2 (124M parameters)
+硬件：A100 40GB
+任务：优化训练吞吐量 (samples/sec)
+```
+
+### Baseline Profile
 
 ```bash
-# 1. 端到端性能测试
-python benchmark.py --model resnet50 --batch-size 32
-
-# 2. Nsight Systems 全局 profile
-nsys profile -o baseline \
-    --trace=cuda,nvtx,osrt \
-    --cuda-memory-usage=true \
-    python benchmark.py
-
-# 3. 查看时间线，找到热点区域
-nsys-ui baseline.qdrep
+nsys profile -o baseline python train.py --profile
 ```
 
-### 第二阶段：定位瓶颈
+**结果**：
 
-```bash
-# 在 Nsight Systems 中识别：
-# - 最耗时的 kernel
-# - GPU idle 时间
-# - 内存拷贝瓶颈
-# - CPU 瓶颈
+```
+端到端：每个 batch 500 ms
 
-# 对热点 kernel 进行详细分析
-ncu --set full -o kernel_profile \
-    --kernel-name <bottleneck_kernel> \
-    python benchmark.py
-
-ncu-ui kernel_profile.ncu-rep
+分解：
+- Forward pass: 200 ms (40%)
+  - Self-Attention: 120 ms (24%)
+  - FFN: 60 ms (12%)
+  - LayerNorm: 20 ms (4%)
+- Backward pass: 250 ms (50%)
+- Optimizer step: 30 ms (6%)
+- Data loading: 15 ms (3%)
+- Others: 5 ms (1%)
 ```
 
-### 第三阶段：优化策略
+### 优化路径
 
-根据瓶颈类型选择策略：
+#### 第一步：Attention 优化 (最大瓶颈)
+
+**问题诊断**：
 
 ```python
-def optimize_pipeline(bottleneck_type):
-    if bottleneck_type == "many_small_kernels":
-        # → 算子融合
-        return fuse_kernels()
+# 标准 Attention 实现
+Q = x @ Wq  # [B, N, D]
+K = x @ Wk
+V = x @ Wv
 
-    elif bottleneck_type == "memory_bound":
-        # → 内存优化
-        return optimize_memory_access()
+scores = Q @ K.T  # [B, N, N] ← 大矩阵！
+scores = scores / sqrt(D)
+attn = softmax(scores)
+output = attn @ V
 
-    elif bottleneck_type == "cpu_bottleneck":
-        # → 减少 CPU-GPU 同步
-        return use_cuda_graphs()
+# 问题分析：
+# 1. 中间矩阵 scores: [B, N, N] = [32, 2048, 2048] = 128 MB
+# 2. Memory 操作：
+#    - QK^T: 读 Q (16MB) + K (16MB), 写 scores (128MB) = 160 MB
+#    - Softmax: 读写 scores = 256 MB
+#    - Attn @ V: 读 attn (128MB) + V (16MB), 写 output (16MB) = 160 MB
+#    总共：~576 MB
 
-    elif bottleneck_type == "gpu_idle":
-        # → 增加并行度
-        return use_multiple_streams()
+# 3. 计算量：
+#    FLOPS = 2*B*N*N*D + 2*B*N*N*D = 4*B*N*N*D = 4*32*2048*2048*64 = 34 GFLOPS
+#    AI = 34 GFLOPS / 576 MB = 0.06 FLOPS/Byte
+#
+#    → Memory-bound（AI << 13）
+#    → 理论峰值 = 0.06 * 1.5 TB/s = 90 GFLOPS
+#    → 实际测量 = 70 GFLOPS → 78% 效率
 
-    elif bottleneck_type == "memory_copy":
-        # → 重叠计算与通信
-        return overlap_compute_copy()
+# 结论：标准 Attention 的瓶颈是中间矩阵的内存访问
 ```
 
-### 第四阶段：验证改进
+**优化：Flash Attention**
 
 ```python
+# Flash Attention 核心思想：
+# 1. 分块计算，避免实体化整个 attention matrix
+# 2. 使用 SRAM (shared memory) 而不是 HBM
+
+# 理论分析：
+# Memory 访问（Flash Attention）：
+#   - 优化后 ~50 MB (相比 576 MB)
+#   - IO 复杂度：O(N^2 d^2 / M)，其中 M = SRAM size
+#
+# 时间：120 ms → 40 ms (3x 加速)
+# 总体：500 ms → 380 ms (1.32x)
+```
+
+**关键洞察**：
+```
+有时算法级别的优化比 kernel 级别优化重要 100 倍
+
+标准 Attention kernel 优化到极致：78% → 95% 效率
+→ 提升：120 ms → 93 ms (1.3x)
+
+换成 Flash Attention:
+→ 提升：120 ms → 40 ms (3x)
+
+ROI 差距：Flash Attention 的 ROI 是 kernel 优化的 10 倍
+```
+
+#### 第二步：混合精度训练
+
+```python
+from torch.cuda.amp import autocast, GradScaler
+
+scaler = GradScaler()
+
+# Forward 使用 FP16
+with autocast():
+    output = model(input)
+    loss = criterion(output, target)
+
+# Backward
+scaler.scale(loss).backward()
+scaler.step(optimizer)
+scaler.update()
+
+# 结果：
+# - Forward: 200 ms → 120 ms (1.67x)
+# - Backward: 250 ms → 150 ms (1.67x)
+# - 总体：380 ms → 250 ms (1.52x)
+
+# 为什么这么快？
+# 1. FP16 GEMM 使用 Tensor Cores: 19.5 → 312 TFLOPS (16x 峰值算力)
+# 2. FP16 内存带宽需求减半: 2 bytes vs 4 bytes
+# 3. 实际测量：Tensor Core 利用率从 0% → 85%
+```
+
+#### 第三步：Gradient Checkpointing（内存换时间的反例）
+
+```python
+# 问题：大模型 OOM
+
+# Gradient Checkpointing 原理：
+# - Forward: 不保存中间激活值（除了 checkpoints）
+# - Backward: 重新计算中间激活值
+
+# 权衡：
+# 内存：减少 ~50% (40GB → 20GB)
+# 时间：增加 ~30% (250ms → 325ms)
+
+# 但总体：
+# 之前：batch_size = 16, time = 250ms
+# 现在：batch_size = 32, time = 325ms
+# 吞吐量：(16/250) → (32/325) = 0.064 → 0.098 samples/ms (1.53x)
+
+# 结论：虽然单个 batch 变慢了，但能跑更大的 batch，总吞吐量提升
+```
+
+#### 第四步：Operator Fusion
+
+```python
+# Profile 发现：LayerNorm 很频繁
+nsys profile --trace=cuda ./train.py
+
+# 输出：
+# - layernorm_kernel: 被调用 100 次，每次 200μs，总 20ms
+# - 但 kernel 之间有 gap
+
+# 优化：Fused LayerNorm + Linear
+# PyTorch 2.0: torch.compile 自动融合
+
+@torch.compile
+def fused_block(x, ln_weight, ln_bias, linear_weight, linear_bias):
+    x = F.layer_norm(x, normalized_shape, ln_weight, ln_bias)
+    x = F.linear(x, linear_weight, linear_bias)
+    return x
+
+# 结果：
+# - LayerNorm + Linear: 20ms + 15ms = 35ms
+# - Fused: 25ms
+# - 加速：1.4x (局部), 1.04x (全局)
+```
+
+### 最终结果
+
+```
+优化路径汇总：
+
+Baseline: 500 ms/batch, 32 samples/sec
+
+1. Flash Attention:  500 → 380 ms (1.32x) → 42 samples/sec
+2. Mixed Precision:  380 → 250 ms (1.52x) → 64 samples/sec
+3. Larger Batch:     250 → 325 ms (but batch 16→32) → 98 samples/sec
+4. Operator Fusion:  325 → 312 ms (1.04x) → 102 samples/sec
+
+总体加速：3.2x (32 → 102 samples/sec)
+```
+
+**关键教训**：
+1. **算法优化 >> kernel 优化** (Flash Attention 带来最大提升)
+2. **硬件特性很重要** (Tensor Cores)
+3. **有时变慢是为了更快** (Gradient Checkpointing)
+4. **Amdahl's Law** (优先优化 Attention，而不是 LayerNorm)
+
+---
+
+## 反直觉的优化策略
+
+### 1. "慢"的算法可能更快
+
+**案例：Sorting**
+
+```python
+# GPU 上：
+
+# QuickSort:
+# - CPU: O(n log n), 非常快
+# - GPU: 大量分支，warp divergence 严重
+# 实际性能：100ms for 10M elements
+
+# Radix Sort:
+# - CPU: O(nk), 通常比 QuickSort 慢
+# - GPU: 无分支，完美并行
+# 实际性能：10ms for 10M elements
+
+# 结论：在 GPU 上，O(nk) 的算法比 O(n log n) 快 10 倍
+```
+
+**原因**：
+```
+理论复杂度忽略了常数因子和硬件特性
+
+GPU 性能 = f(算法复杂度, 并行度, 内存访问, 分支)
+
+有时：
+  高复杂度 + 高并行度 + 无分支 > 低复杂度 + 低并行度 + 多分支
+```
+
+### 2. 更多的计算可能减少时间
+
+**案例：Im2Col**
+
+```python
+# 卷积的两种实现：
+
+# 方法 1：直接卷积
+# - 计算量：O(C_in * C_out * K * K * H * W)
+# - 内存访问：复杂，不规则
+# - 实际性能：150 ms
+
+# 方法 2：Im2Col + GEMM
+# - 展开 input: [B, C, H, W] → [B*H*W, C*K*K]
+# - 计算量：更多（展开有冗余）！
+# - 内存访问：GEMM 极度优化（cuBLAS）
+# - 实际性能：50 ms
+
+# 结论：冗余计算 + 极致优化的 GEMM > 精确计算 + 复杂访问
+```
+
+**原因**：
+```
+cuBLAS GEMM 的优化程度：~90% 峰值性能
+手写卷积 kernel 的优化程度：~30% 峰值性能
+
+即使 GEMM 做了 2 倍的计算，仍然更快：
+  0.9 * 2 > 0.3 * 1 → 还快了 6 倍
+```
+
+### 3. 占用率不是越高越好
+
+**反直觉案例**：
+
+```python
+# Kernel A:
+# - Occupancy: 100%
+# - Shared Memory: 0
+# - Performance: 100 ms
+
+# Kernel B:
+# - Occupancy: 50% (因为用了大量 Shared Memory)
+# - Shared Memory: 96 KB/SM
+# - Performance: 60 ms
+
+# 为什么 Occupancy 低反而更快？
+
+# 答案：Occupancy 只是"可能并行的 warps 数量"
+#       但如果这些 warps 都在等内存，多了也没用
+
+# Kernel B 用 Shared Memory 缓存了数据：
+# - 减少了 HBM 访问
+# - 虽然 Occupancy 低，但每个 warp 真正在计算
+# - 结果：更快
+```
+
+**量化分析**：
+
+```
+Kernel A:
+  - 32 个 warps 同时运行
+  - 每个 warp 90% 时间在等 HBM (stalled)
+  - 有效计算时间：32 * 10% = 3.2 warps
+
+Kernel B:
+  - 16 个 warps 同时运行
+  - 每个 warp 30% 时间在等 Shared Memory (快得多)
+  - 有效计算时间：16 * 70% = 11.2 warps
+
+11.2 > 3.2 → Kernel B 快 3.5 倍
+```
+
+**结论**：关注"有效占用率" (Active Warps)，而不是"理论占用率"
+
+### 4. 融合不一定总是好的
+
+**案例**：
+
+```python
+# 两个 kernel：
+# Kernel A: GEMM (4096x4096), compute-bound, 80% Tensor Core 利用率
+# Kernel B: Element-wise Add, memory-bound
+
+# 融合后：
+# - 无法使用 Tensor Cores（mixed operation）
+# - Compute-bound 变成 memory-bound
+# - 性能：30 ms + 5 ms = 35 ms → 融合后 50 ms（更慢！）
+
+# 结论：不要融合 compute-bound 和 memory-bound kernel
+```
+
+**什么时候融合**：
+```
+✅ 融合：
+  - 多个 memory-bound element-wise kernels
+  - 中间结果只用一次
+  - 融合后仍在同一个 bound 类型
+
+❌ 不融合：
+  - 一个 compute-bound + 一个 memory-bound
+  - 中间结果被多次使用
+  - 融合后导致寄存器溢出
+```
+
+### 5. 最快的代码是不写的代码
+
+**案例：Dropout**
+
+```python
+# Training: 需要 Dropout
+# Inference: 不需要 Dropout
+
+# ❌ 很多代码在 inference 时仍然调用 dropout（虽然 p=0）
+if self.training:
+    x = F.dropout(x, p=0.1)
+else:
+    x = F.dropout(x, p=0.0)  # ← 仍然调用了 kernel！
+
+# ✅ 正确做法
+if self.training:
+    x = F.dropout(x, p=0.1)
+# else: 什么都不做
+
+# 性能差异：10 ms vs 0 ms
+```
+
+**教训**：
+- 删除代码是最好的优化
+- 检查 inference 代码路径，删除所有训练相关的操作
+- 使用 `torch.jit.script` 自动做这些优化
+
+---
+
+## Production 环境的隐藏陷阱
+
+### 陷阱 1：Batch Size 动态变化
+
+```python
+# Lab 环境：固定 batch_size = 32, 性能很好
+
+# Production:
+# - 真实请求：batch 大小不固定 (1, 5, 16, 32, 64...)
+# - CUDA kernel 对不同 batch size 性能差异巨大
+
+# 测量：
+batch_size=1:  50 ms/sample
+batch_size=32: 5 ms/sample  (10x faster per sample!)
+batch_size=64: 3 ms/sample
+
+# 问题：为什么差这么多？
+
+# 原因 1：Launch overhead 被摊薄
+launch_overhead = 10 μs
+batch=1:  10 μs / 1 = 10 μs per sample
+batch=32: 10 μs / 32 = 0.3 μs per sample
+
+# 原因 2：硬件利用率
+batch=1:  80 个 SM, 只用了 10 个 (12%)
+batch=32: 80 个 SM, 用了 75 个 (94%)
+
+# 解决方案：Dynamic Batching
+# 聚合多个小请求到一个 batch
+```
+
+**Dynamic Batching 实现**：
+
+```python
+import asyncio
 import torch
-import time
 
-def compare_performance(baseline_fn, optimized_fn, input_data):
-    """对比优化前后的性能"""
+class DynamicBatcher:
+    def __init__(self, model, max_batch_size=32, max_wait_ms=10):
+        self.model = model
+        self.max_batch_size = max_batch_size
+        self.max_wait_ms = max_wait_ms
+        self.queue = []
 
-    # Baseline
-    start = time.time()
-    for _ in range(100):
-        baseline_fn(input_data)
-    torch.cuda.synchronize()
-    baseline_time = (time.time() - start) / 100 * 1000
+    async def infer(self, x):
+        """单个请求"""
+        future = asyncio.Future()
+        self.queue.append((x, future))
 
-    # Optimized
-    start = time.time()
-    for _ in range(100):
-        optimized_fn(input_data)
-    torch.cuda.synchronize()
-    optimized_time = (time.time() - start) / 100 * 1000
+        # 如果达到 max_batch_size，立即执行
+        if len(self.queue) >= self.max_batch_size:
+            await self._execute_batch()
 
-    speedup = baseline_time / optimized_time
+        # 否则等待 max_wait_ms
+        try:
+            await asyncio.wait_for(future, timeout=self.max_wait_ms/1000)
+        except asyncio.TimeoutError:
+            await self._execute_batch()
 
-    print(f"Baseline:   {baseline_time:.2f} ms")
-    print(f"Optimized:  {optimized_time:.2f} ms")
-    print(f"Speedup:    {speedup:.2f}x")
+        return await future
 
-    return speedup
+    async def _execute_batch(self):
+        if not self.queue:
+            return
+
+        batch_x = torch.stack([x for x, _ in self.queue])
+        batch_y = self.model(batch_x)
+
+        for (_, future), y in zip(self.queue, batch_y):
+            future.set_result(y)
+
+        self.queue.clear()
+
+# 使用
+batcher = DynamicBatcher(model)
+
+# 多个并发请求自动 batching
+results = await asyncio.gather(*[
+    batcher.infer(x1),
+    batcher.infer(x2),
+    # ...
+])
 ```
 
-### 第五阶段：持续监控
+### 陷阱 2：显存碎片化
 
 ```python
-#!/usr/bin/env python3
-"""性能回归测试"""
+# 现象：训练跑了几个小时后 OOM，但一开始没问题
+
+# 原因：显存碎片化
+
+# PyTorch 内存分配器：
+# - 分配时：找一个足够大的 block
+# - 释放时：标记为 free，但不归还 CUDA
+# - 问题：长时间运行后，大量小碎片
+
+# 诊断：
+print(torch.cuda.memory_allocated())  # 实际使用
+print(torch.cuda.memory_reserved())   # 从 CUDA 申请的
+
+# 如果 reserved >> allocated → 碎片化严重
+
+# 解决方案 1：定期清空缓存
+if iteration % 1000 == 0:
+    torch.cuda.empty_cache()
+
+# 解决方案 2：使用 memory pool 策略
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+
+# 解决方案 3：固定内存分配（最彻底）
+# 预分配所有需要的 tensor，训练时复用
+```
+
+### 陷阱 3：多 GPU 的隐藏同步
+
+```python
+# DataParallel (DP) vs DistributedDataParallel (DDP)
+
+# ❌ DataParallel (慢)
+model = nn.DataParallel(model)
+
+# 问题：
+# 1. 主 GPU (GPU 0) 负载不均
+# 2. 每次 forward/backward 都要同步
+# 3. GIL 限制
+
+# 测量（4x A100）：
+# - 理论：4x 加速
+# - DP 实际：2.5x
+# - 效率：62.5%
+
+# ✅ DistributedDataParallel (快)
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+model = DDP(model, device_ids=[local_rank])
+
+# 测量（4x A100）：
+# - DDP 实际：3.8x
+# - 效率：95%
+
+# 为什么 DDP 快？
+# - 每个 GPU 独立运行
+# - 只在 backward 结束时同步 gradients
+# - 使用 NCCL all-reduce (高度优化)
+```
+
+### 陷阱 4：CPU 瓶颈
+
+```python
+# 现象：GPU 利用率只有 60%
+
+# nsys profile 发现：GPU 在等 CPU
+
+# 常见原因：
+
+# 1. 数据预处理太慢
+# ❌
+for batch in dataloader:  # CPU preprocessing
+    batch_gpu = batch.cuda()
+    model(batch_gpu)
+
+# ✅
+dataloader = DataLoader(
+    dataset,
+    batch_size=32,
+    num_workers=8,        # 多进程
+    pin_memory=True,      # 避免 pageable memory
+    prefetch_factor=4,    # 预取
+)
+
+# 2. Metric 计算太频繁
+# ❌
+for batch in dataloader:
+    output = model(batch)
+    acc = calculate_accuracy(output, target)  # 每个 batch 都计算
+
+# ✅
+for batch in dataloader:
+    output = model(batch)
+    outputs.append(output)  # 累积
+
+acc = calculate_accuracy(torch.cat(outputs), targets)  # 最后计算一次
+
+# 3. 同步太频繁
+# ❌
+for i in range(1000):
+    loss = model(data)
+    if loss.item() > threshold:  # .item() 同步！
+        break
+
+# ✅
+for i in range(1000):
+    loss = model(data)
+    losses.append(loss)
+
+torch.cuda.synchronize()
+if any(l.item() > threshold for l in losses):
+    break
+```
+
+### 陷阱 5：CUDA Kernel 版本不匹配
+
+```python
+# 问题：在 A100 上优化的代码，在 V100 上更慢
+
+# 原因：架构不同
+
+# A100 (Ampere, sm_80):
+# - Tensor Cores for FP32
+# - Async copy
+# - 更大的 L2 cache (40 MB)
+
+# V100 (Volta, sm_70):
+# - 没有 FP32 Tensor Cores
+# - 同步 copy
+# - 小 L2 (6 MB)
+
+# 解决方案：Runtime detection
 
 import torch
-import json
-import subprocess
-from datetime import datetime
 
-def run_benchmark():
-    """运行性能测试并记录结果"""
-    # ... benchmark code
+def get_gemm_kernel(device):
+    capability = torch.cuda.get_device_capability(device)
 
-    result = {
-        "timestamp": datetime.now().isoformat(),
-        "latency_ms": latency,
-        "throughput": throughput,
-        "gpu_util": gpu_util,
-        "memory_usage": memory_usage,
-    }
+    if capability >= (8, 0):  # Ampere+
+        return gemm_tensor_core_fp32
+    elif capability >= (7, 0):  # Volta+
+        return gemm_tensor_core_fp16
+    else:
+        return gemm_cuda_core
 
-    return result
-
-def check_regression(current, baseline, threshold=0.1):
-    """检查性能回归"""
-    if current["latency_ms"] > baseline["latency_ms"] * (1 + threshold):
-        print(f"⚠️  Performance regression detected!")
-        print(f"   Baseline: {baseline['latency_ms']:.2f} ms")
-        print(f"   Current:  {current['latency_ms']:.2f} ms")
-        return True
-    return False
-
-# 主循环
-baseline = load_baseline()
-while True:
-    current = run_benchmark()
-
-    if check_regression(current, baseline):
-        # 触发告警
-        send_alert()
-
-    save_result(current)
-    time.sleep(3600)  # 每小时检查一次
+# 或使用 Triton auto-tuning
+# Triton 会在目标硬件上自动选择最优配置
 ```
 
 ---
 
-## 最佳实践总结
+## 总结：专家级优化的思维模型
 
-### 优化检查清单
-
-#### 算子级别 ✓
-- [ ] 使用 Nsight Compute 分析单个 kernel
-- [ ] 优化内存访问模式（coalesced access）
-- [ ] 提高占用率
-- [ ] 减少 warp divergence
-- [ ] 使用 Tensor Cores（如果适用）
-
-#### 系统级别 ✓
-- [ ] 使用 Nsight Systems 分析全局性能
-- [ ] 识别并优化 GPU idle 时间
-- [ ] 算子融合减少 kernel 启动开销
-- [ ] 使用 CUDA Graphs 降低启动延迟
-- [ ] 多流并行提高吞吐量
-
-#### 内存级别 ✓
-- [ ] 使用内存池避免频繁分配
-- [ ] In-place 操作减少内存使用
-- [ ] 重叠计算与通信
-- [ ] Workspace 复用
-
-#### 应用级别 ✓
-- [ ] 选择合适的算法
-- [ ] 批处理提高吞吐量
-- [ ] 数据预处理放在 CPU
-- [ ] 异步数据加载
-
----
-
-## 工具链总结
-
-```
-性能分析工具链：
-
-1. 宏观分析（全局视角）
-   ├─ Nsight Systems：时间线、CPU-GPU 交互
-   ├─ PyTorch Profiler：Python 层性能
-   └─ NVTX：自定义标记
-
-2. 微观分析（Kernel 级别）
-   ├─ Nsight Compute：详细指标、Roofline
-   ├─ nvprof（已废弃）
-   └─ cuda-memcheck：内存错误检查
-
-3. 代码分析
-   ├─ Nsight Compute：源代码级分析
-   ├─ cuobjdump：查看 PTX/SASS
-   └─ nvdisasm：反汇编
-
-4. 实时监控
-   ├─ nvidia-smi：GPU 利用率
-   ├─ nvtop：交互式监控
-   └─ dcgm：数据中心 GPU 管理
-```
-
----
-
-## 案例研究：优化一个完整的训练循环
+### 1. 建立性能直觉
 
 ```python
-# === 优化前 ===
-def train_loop_baseline(model, dataloader, optimizer):
-    for batch in dataloader:
-        # CPU-GPU 拷贝（同步点）
-        inputs = batch['image'].cuda()
-        labels = batch['label'].cuda()
+# 初级工程师：盲目优化
+"我改了这里，跑一下看看快不快"
 
-        # 前向传播
-        outputs = model(inputs)
+# 高级工程师：量化预测
+"理论峰值是 X，现在是 Y，差距是 Z，问题在 W"
 
-        # 计算损失
-        loss = criterion(outputs, labels)
+# 专家：建立 mental model
+"根据 Roofline，这个 kernel 的 AI 是 0.5，所以是 memory-bound
+ 根据 Amdahl's Law，优化这个只能提升 15%
+ 根据硬件手册，L2 带宽是 5 TB/s，我们只用了 60%
+ → 应该优化 L2 cache 复用，而不是 L1 或寄存器"
+```
 
-        # 反向传播
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+### 2. 优化的优先级
 
-# Nsight Systems 显示：
-# - 大量 H2D 拷贝时间
-# - GPU 在等待数据时 idle
-# - 小 kernel 启动开销大
+```
+第一优先级（10x+ 提升）：
+├─ 算法选择 (Flash Attention, Fused kernels)
+├─ 硬件特性 (Tensor Cores, Mixed Precision)
+└─ 系统架构 (Multi-GPU, Pipeline Parallelism)
 
-# === 优化后 ===
-def train_loop_optimized(model, dataloader, optimizer):
-    # 1. 异步数据加载
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=32,
-        num_workers=4,
-        pin_memory=True,  # ← 启用 pinned memory
-        prefetch_factor=2,
-    )
+第二优先级（2-5x 提升）：
+├─ Operator Fusion
+├─ Memory Access Patterns
+└─ Occupancy Optimization
 
-    # 2. 使用 AMP 混合精度
-    scaler = torch.cuda.amp.GradScaler()
+第三优先级（1.1-1.5x 提升）：
+├─ ILP, Loop Unrolling
+├─ CUDA Graphs
+└─ Kernel细节优化
+```
 
-    # 3. 使用 CUDA Graph
-    static_input = torch.randn(32, 3, 224, 224, device='cuda')
-    static_label = torch.randint(0, 1000, (32,), device='cuda')
+### 3. 思考清单
 
-    # Warmup
-    for _ in range(3):
-        with torch.cuda.amp.autocast():
-            output = model(static_input)
-            loss = criterion(output, static_label)
+每次优化前问自己：
 
-    # Capture
-    g = torch.cuda.CUDAGraph()
-    optimizer.zero_grad(set_to_none=True)
-    with torch.cuda.graph(g):
-        with torch.cuda.amp.autocast():
-            static_output = model(static_input)
-            static_loss = criterion(static_output, static_label)
-        scaler.scale(static_loss).backward()
+```
+□ 这个优化能提升多少？(量化)
+□ 需要多少时间？(工程成本)
+□ ROI 是多少？(收益/成本)
+□ 有没有更高 ROI 的优化？(opportunity cost)
+□ 优化后的理论极限是多少？(天花板在哪)
+□ 我们离理论极限还有多远？(优化空间)
+```
 
-    # Training loop
-    for batch in dataloader:
-        # 拷贝数据到静态buffer
-        static_input.copy_(batch['image'])
-        static_label.copy_(batch['label'])
+### 4. 工具链
 
-        # Replay graph（非常快！）
-        g.replay()
+```
+Stage 1: 全局分析 (10 分钟)
+└─ nsys profile → 找到热点
 
-        # 更新参数
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+Stage 2: 瓶颈定位 (30 分钟)
+├─ Roofline 分析 → 理论极限
+├─ Amdahl's Law → 优化优先级
+└─ 五维分析 → 具体瓶颈类型
 
-# 性能提升：2-4倍！
+Stage 3: 深入优化 (几小时到几天)
+├─ 算法级：Flash Attention, 更好的算法
+├─ 系统级：Fusion, Multi-stream, CUDA Graphs
+└─ Kernel级：NCU 深入分析，内存优化
+
+Stage 4: 验证 (1 小时)
+├─ 性能测试：端到端时间
+├─ Profile 对比：优化前后差异
+└─ 正确性验证：数值精度
 ```
 
 ---
 
-## 总结
+## 参考资料
 
-全局优化的核心思想：
+### 论文
+- [FlashAttention: Fast and Memory-Efficient Exact Attention](https://arxiv.org/abs/2205.14135)
+- [Roofline: An Insightful Visual Performance Model](https://people.eecs.berkeley.edu/~kubitron/cs252/handouts/papers/RooflineVyNoYellow.pdf)
 
-1. **从宏观到微观**：先用 Nsight Systems 找大问题，再用 NCU 优化细节
-2. **系统思维**：不只看 kernel，要看整个数据流
-3. **权衡取舍**：有时候"更慢"的算法配合更好的系统优化反而更快
-4. **持续监控**：性能优化不是一次性的，需要持续关注
+### 工具文档
+- [NVIDIA Nsight Systems](https://docs.nvidia.com/nsight-systems/)
+- [NVIDIA Nsight Compute](https://docs.nvidia.com/nsight-compute/)
+- [CUDA C++ Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/)
 
-**记住：**
-```
-最快的代码是不运行的代码
-次快的代码是只运行一次的代码
-第三快的代码是并行运行的代码
-```
-
----
-
-## 参考资源
-
-- [NVIDIA Nsight Systems Documentation](https://docs.nvidia.com/nsight-systems/)
-- [PyTorch Profiler Tutorial](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html)
-- [CUDA Graphs Documentation](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cuda-graphs)
-- [CUDA Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/)
+### 深入阅读
+- GPU 架构：[NVIDIA Ampere Architecture](https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.pdf)
+- 性能模型：[Performance Analysis and Tuning on Modern CPUs and GPUs](http://cs.utexas.edu/~pingali/CS395T/2021sp/)
